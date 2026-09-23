@@ -5,14 +5,16 @@ import (
 	"strconv"
 	"task/config"
 	model "task/module"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 type CreateTaskRequest struct {
-	Name     string `json:"name" binding:"required"`
-	Type     string `json:"type" binding:"required"`
-	Interval int    `json:"interval" binding:"required"`
+	Name      string    `json:"name" binding:"required"`
+	Type      string    `json:"type" binding:"required"`
+	Interval  int       `json:"interval" binding:"required"`
+	Next_time time.Time `json:"next_run_time"  binding:"required"`
 }
 
 // Post /api/tasks
@@ -24,14 +26,15 @@ func CreateTask(c *gin.Context) {
 		})
 	}
 	const sql = `INSERT INTO tasks
-				(name,type,interval_seconds,status)
-				VALUES (?,?,?,?)`
+				(name,type,interval_seconds,status,next_run_time)
+				VALUES (?,?,?,?,?)`
 	result, err := config.DB.Exec(
 		sql,
 		req.Name,
 		req.Type,
 		req.Interval,
 		"ENABLED",
+		req.Next_time,
 	)
 
 	if err != nil {
@@ -77,7 +80,8 @@ func GetTasks(c *gin.Context) {
 			interval_seconds,
 			status,
 			created_at,
-			updated_at
+			updated_at,
+			next_run_time
 		FROM tasks
 		ORDER BY id DESC
 	`
