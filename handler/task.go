@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
 	"task/config"
@@ -24,17 +26,27 @@ func CreateTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": err.Error(),
 		})
+		return
 	}
+	// 状态先确定在本地对象上，再由对象落库
+	task := model.Task{
+		Name:      req.Name,
+		Type:      req.Type,
+		Interval:  req.Interval,
+		Status:    model.TaskEnabled,
+		Next_time: req.Next_time,
+	}
+
 	const sql = `INSERT INTO tasks
 				(name,type,interval_seconds,status,next_run_time)
 				VALUES (?,?,?,?,?)`
 	result, err := config.DB.Exec(
 		sql,
-		req.Name,
-		req.Type,
-		req.Interval,
-		"ENABLED",
-		req.Next_time,
+		task.Name,
+		task.Type,
+		task.Interval,
+		task.Status,
+		task.Next_time,
 	)
 
 	if err != nil {
@@ -51,13 +63,13 @@ func CreateTask(c *gin.Context) {
 		})
 		return
 	}
+	task.ID = uint(id)
 
-	var task model.Task
-
+	// created_at / updated_at 由数据库生成，回读补全同一个对象
 	err = config.DB.Get(
 		&task,
 		"SELECT * FROM tasks WHERE id = ?",
-		id,
+		task.ID,
 	)
 
 	if err != nil {
@@ -110,38 +122,8 @@ func DisableTask(c *gin.Context) {
 		return
 	}
 
-	const updateSQL = `
-		UPDATE tasks
-		SET status = 'DISABLED'
-		WHERE id = ?
-	`
-
-	result, err := config.DB.Exec(updateSQL, id)
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": err.Error(),
-		})
-		return
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": err.Error(),
-		})
-		return
-	}
-
-	if rows == 0 {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": "任务不存在",
-		})
-		return
-	}
-
+	// 1. 先把任务加载成本地对象；不存在则 404
 	var task model.Task
-
 	err = config.DB.Get(
 		&task,
 		"SELECT * FROM tasks WHERE id = ?",
@@ -149,6 +131,53 @@ func DisableTask(c *gin.Context) {
 	)
 
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "任务不存在",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	// 2. 状态先改在本地对象上
+	task.Status = model.TaskDisabled
+
+	// 3. 再由对象落库
+	const updateSQL = `
+		UPDATE tasks
+		SET status = ?
+		WHERE id = ?
+	`
+
+	// 不能靠 RowsAffected()==0 判断记录不存在：MySQL 返回的是实际改变的行数，
+	// 重复停用一个已停用的任务同样是 0 行，会被误判成 404；存在性以第 4 步的回读为准。
+	_, err = config.DB.Exec(updateSQL, task.Status, task.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	// 4. updated_at 由数据库 ON UPDATE CURRENT_TIMESTAMP 维护，回读进同一个对象
+	// 目前还没有实现，
+	err = config.DB.Get(
+		&task,
+		"SELECT * FROM tasks WHERE id = ?",
+		id,
+	)
+	if err != nil {
+		// 该行可能在 UPDATE 前后被并发删除，此时回读才会看到 ErrNoRows
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "任务不存在",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": err.Error(),
 		})

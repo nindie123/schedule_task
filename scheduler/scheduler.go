@@ -66,12 +66,8 @@ func (s *Scheduler) scan() {
 		// 下一步这里再交给 TaskExecutor：
 		//
 		// s.executor.Execute(task)
-
 		execuater := execuate.NewExecutor(config.DB)
-		for _, task := range tasks {
-			execuater.Exec(&task)
-		} //这里一条一条插入，性能有点差
-		//这里好像从职责分配角度似乎还是有点必要，需要保证每个执行器管理一个任务，算了到时候再说
+		execuater.Exec(&task)
 
 	}
 }
@@ -91,16 +87,16 @@ func (s *Scheduler) findDueTasks() ([]module.Task, error) {
 			created_at,
 			updated_at
 		FROM tasks
-		WHERE status = 'ENABLED'
+		WHERE status = ?
 		  AND next_run_time <= NOW()
 	`
 
-	err := config.DB.Select(&tasks, selectquery)
+	err := config.DB.Select(&tasks, selectquery, module.TaskEnabled)
 	if err != nil {
 		return nil, err
 	}
 	//下面增加的逻辑是修改到期任务下次到期时间，方式后续同一个任务重复进入执行任务表格
-	updatequery := `UPDATE tasks SET next_run_time = DATE_ADD(NOW,INTERVAL 10 MINUTE) WHERE ID = ?`
+	updatequery := `UPDATE tasks SET next_run_time = DATE_ADD(NOW(),INTERVAL 10 MINUTE) WHERE ID = ?`
 	for _, task := range tasks {
 		_, err := config.DB.Exec(updatequery, task.ID)
 		if err != nil {

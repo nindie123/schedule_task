@@ -13,14 +13,14 @@ type Executor struct {
 	DB *sqlx.DB
 }
 type Execute interface {
-	Exe(task *module.Task)
+	Exe(task *module.TaskExecution) error
 }
 
 func (this *Executor) Exe(task *module.TaskExecution) error {
 	time.Sleep(5 * time.Second)
 	now := time.Now()
 	task.FinishedAt = &now
-	task.Status = "success"
+	task.Status = module.ExecutionSuccess
 
 	return nil
 
@@ -32,26 +32,41 @@ func NewExecutor(db *sqlx.DB) *Executor {
 	}
 }
 
-func (this *Executor) init(task *module.Task) *module.TaskExecution {
+func (this *Executor) init(task *module.Task) (*module.TaskExecution, error) {
 	exe_task := this.StartTask(task)
 	err := this.InsertSql(exe_task)
 	if err != nil {
-		fmt.Println("init error : ", err)
+		return nil, err
 	}
-	return exe_task
+	return exe_task, nil
 
 }
 func (this *Executor) Exec(task *module.Task) error {
-	exe_task := this.init(task)
+	exe_task, init_err := this.init(task)
+	if init_err != nil {
+		return fmt.Errorf(
+			"init task %d execution: %w",
+			task.ID,
+			init_err,
+		)
+	}
 	exe_err := this.Exe(exe_task)
 
 	update_err := this.FinishExe(exe_task)
 	if update_err != nil {
-		return update_err
+		return fmt.Errorf(
+			"update task %d execution: %w",
+			task.ID,
+			update_err,
+		)
 	}
 
 	if exe_err != nil {
-		return exe_err
+		return fmt.Errorf(
+			"exe task %d execution: %w",
+			task.ID,
+			exe_err,
+		)
 	}
 
 	return nil
@@ -62,7 +77,7 @@ func (this *Executor) Exec(task *module.Task) error {
 func (this *Executor) StartTask(task *module.Task) *module.TaskExecution {
 	execution := module.TaskExecution{
 		TaskID:       task.ID,
-		Status:       "RUNNING",
+		Status:       module.ExecutionRunning,
 		StartedAt:    time.Now(),
 		FinishedAt:   nil,
 		ErrorMessage: nil,
