@@ -67,7 +67,9 @@ func (s *Scheduler) scan() {
 		//
 		// s.executor.Execute(task)
 		execuater := execuate.NewExecutor(config.DB)
-		execuater.Exec(&task)
+		if err := execuater.Exec(&task); err != nil {
+			fmt.Printf("exec task id=%d failed: %v\n", task.ID, err)
+		}
 
 	}
 }

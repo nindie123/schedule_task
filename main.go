@@ -9,7 +9,11 @@ import (
 )
 
 func main() {
-	config.InitDB()
+	initerr := config.InitDB()
+	if initerr != nil {
+		panic(initerr)
+	}
+
 	s := scheduler.NewScheduler(2 * time.Second)
 	ctx := context.Background()
 	go s.Start(ctx)

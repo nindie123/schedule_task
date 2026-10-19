@@ -1,12 +1,20 @@
 package execuate
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"task/module"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 )
+
+// dbOpTimeout 是单次数据库尝试的超时上限。
+// 注意：FinishExe 没有 ctx 形参，这里只能用 context.Background() 取超时，
+// 因此无法向上传递取消，只能保证单次尝试不会永久挂起。
+const dbOpTimeout = 2 * time.Second
 
 // Executor 负责任务执行流程。
 type Executor struct {
@@ -21,7 +29,6 @@ func (this *Executor) Exe(task *module.TaskExecution) error {
 	now := time.Now()
 	task.FinishedAt = &now
 	task.Status = module.ExecutionSuccess
-
 	return nil
 
 }
@@ -54,6 +61,7 @@ func (this *Executor) Exec(task *module.Task) error {
 
 	update_err := this.FinishExe(exe_task)
 	if update_err != nil {
+
 		return fmt.Errorf(
 			"update task %d execution: %w",
 			task.ID,
@@ -113,6 +121,10 @@ func (this *Executor) InsertSql(execution *module.TaskExecution) error {
 
 // 任务执行完成后的，插入数据库操作
 // 更新任务执行记录
+//
+// 这是 UPDATE ... WHERE id = ?，写入的是绝对值，天然幂等，
+// 所以可以对瞬时故障安全重试。
+// （InsertSql 是 INSERT，不幂等，故刻意不加重试。）
 func (this *Executor) FinishExe(task *module.TaskExecution) error {
 	const query = `
         UPDATE execuate_tasks
@@ -122,26 +134,73 @@ func (this *Executor) FinishExe(task *module.TaskExecution) error {
         WHERE id = ?
     `
 
-	result, err := this.DB.Exec(
-		query,
-		task.ErrorMessage,
-		task.Status,
-		task.FinishedAt,
-		task.ID,
-	)
+	var rows int64
+	err := defaultRetry.Do(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+		defer cancel()
+
+		result, err := this.DB.ExecContext(
+			ctx,
+			query,
+			task.ErrorMessage,
+			task.Status,
+			task.FinishedAt,
+			task.ID,
+		)
+		if err != nil {
+			return err
+		}
+
+		rows, err = result.RowsAffected()
+		return err
+	})
 
 	if err != nil {
 		return fmt.Errorf("update execution failed: %w", err)
 	}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("get affected rows failed: %w", err)
-	}
-
 	if rows == 0 {
-		return fmt.Errorf("execution record not found: id=%d", task.ID)
+		// 如果未更新任何一行，说明没找到该任务，或该行已处于目标状态。
+		// MySQL 返回的是实际改变的行数而非匹配行数：若上一次尝试其实已在
+		// 服务端写入成功、只是响应丢失，这次重试写相同的值就会得到 0 行。
+		// 因此回读确认，避免把一次成功的写入误报成"记录不存在"。
+		applied, verr := this.isFinishApplied(task)
+		if verr != nil {
+			return verr
+		}
+		if !applied {
+			return fmt.Errorf("execution record not found: id=%d", task.ID)
+		}
 	}
 
 	return nil
+}
+
+// isFinishApplied 回读确认目标执行记录是否已经处于目标状态。
+// 返回 (false, nil) 表示记录不存在；返回 error 表示回读本身失败。
+func (this *Executor) isFinishApplied(task *module.TaskExecution) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
+	// 只取需要的两列，避免把未查询的字段一起拉进来。
+	var got struct {
+		Status     module.ExecutionStatus `db:"status"`
+		FinishedAt *time.Time             `db:"finished_at"`
+	}
+
+	err := this.DB.GetContext(
+		ctx,
+		&got,
+		`SELECT status, finished_at FROM execuate_tasks WHERE id = ?`,
+		task.ID,
+	)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("verify execution failed: %w", err)
+	}
+
+	return got.Status == task.Status && got.FinishedAt != nil, nil
 }
