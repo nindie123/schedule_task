@@ -13,9 +13,12 @@ import (
 )
 
 type CreateTaskRequest struct {
-	Name      string    `json:"name" binding:"required"`
-	Type      string    `json:"type" binding:"required"`
-	Interval  int       `json:"interval" binding:"required"`
+	Name string `json:"name" binding:"required"`
+	Type string `json:"type" binding:"required"`
+	// gt=0：间隔为 0 会让任务无法推进下次执行时间。
+	Interval int `json:"interval" binding:"required,gt=0"`
+	// MaxRuns 不传表示不限次数；一旦传入必须大于 0。
+	MaxRuns   *int      `json:"max_runs" binding:"omitempty,gt=0"`
 	Next_time time.Time `json:"next_run_time"  binding:"required"`
 }
 
@@ -33,13 +36,14 @@ func CreateTask(c *gin.Context) {
 		Name:      req.Name,
 		Type:      req.Type,
 		Interval:  req.Interval,
+		MaxRuns:   req.MaxRuns,
 		Status:    model.TaskEnabled,
-		Next_time: req.Next_time,
+		Next_time: &req.Next_time,
 	}
 
 	const sql = `INSERT INTO tasks
-				(name,type,interval_seconds,status,next_run_time)
-				VALUES (?,?,?,?,?)`
+				(name,type,interval_seconds,status,next_run_time,max_runs)
+				VALUES (?,?,?,?,?,?)`
 	result, err := config.DB.Exec(
 		sql,
 		task.Name,
@@ -47,6 +51,7 @@ func CreateTask(c *gin.Context) {
 		task.Interval,
 		task.Status,
 		task.Next_time,
+		task.MaxRuns,
 	)
 
 	if err != nil {
@@ -90,6 +95,7 @@ func GetTasks(c *gin.Context) {
 			name,
 			type,
 			interval_seconds,
+			max_runs,
 			status,
 			created_at,
 			updated_at,

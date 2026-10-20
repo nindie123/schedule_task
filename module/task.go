@@ -5,9 +5,13 @@ import "time"
 type TaskStatus string
 type ExecutionStatus string
 
+// 后续完善其他功能的时候在进行进一步的更新
 const (
-	TaskEnabled  TaskStatus = "ENABLED"
+	TaskEnabled TaskStatus = "ENABLED"
+	// TaskDisabled 表示任务被手动停用，不会再次调度。
 	TaskDisabled TaskStatus = "DISABLED"
+	// TaskCompleted 表示重复任务已达到 max_runs 的成功执行次数，正常结束。
+	TaskCompleted TaskStatus = "COMPLETED"
 )
 
 const (
@@ -18,14 +22,18 @@ const (
 
 // 最开始任务表
 type Task struct {
-	ID        uint       `db:"id" json:"id"`
-	Name      string     `db:"name" json:"name"`
-	Type      string     `db:"type" json:"type"`
-	Interval  int        `db:"interval_seconds" json:"interval"`
+	ID       uint   `db:"id" json:"id"`
+	Name     string `db:"name" json:"name"`
+	Type     string `db:"type" json:"type"`
+	Interval int    `db:"interval_seconds" json:"interval"`
+	// MaxRuns 是最大成功执行次数，nil 表示不限次数。
+	// 失败不计入次数，因此停止判定统计的是执行记录中的 SUCCESS 行数。
+	MaxRuns   *int       `db:"max_runs" json:"max_runs"`
 	Status    TaskStatus `db:"status" json:"status"`
 	CreatedAt time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt time.Time  `db:"updated_at" json:"updated_at"`
-	Next_time time.Time  `db:"next_run_time" json:"next_runtime"`
+	// Next_time 使用指针，因为任务完成后该列会被置为 NULL。
+	Next_time *time.Time `db:"next_run_time" json:"next_runtime"`
 }
 
 // 到达执行时间的任务表

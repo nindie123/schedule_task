@@ -28,7 +28,10 @@ task/
 │   └── task.go              HTTP 处理函数：创建任务、查询任务列表、停用任务
 │
 ├── scheduler/
-│   └── scheduler.go         调度器：按固定周期扫描到期任务，改下次执行时间，交给执行器
+│   └── scheduler.go         调度器：按固定周期扫描到期任务，原子认领后交给执行器
+│
+├── migrations/
+│   └── 001_add_max_runs.sql 数据库迁移：max_runs 列与执行记录统计索引
 │
 └── execuate/                执行器（目录名为历史拼写，正确拼写应为 execute）
     ├── execuate.go          执行流程：写执行记录 → 执行 → 回写结果
@@ -72,7 +75,8 @@ task/
 | `name` | varchar(128) NOT NULL | 任务名 |
 | `type` | varchar(64) NOT NULL | 任务类型，如 `cron`、`ICU_CHECK`（**目前未被使用**） |
 | `interval_seconds` | int NOT NULL | 执行间隔（秒） |
-| `status` | varchar(32) NOT NULL | `ENABLED` / `DISABLED` |
+| `max_runs` | int NULL | 最大成功执行次数；`NULL` 表示不限，`1` 表示只执行一次 |
+| `status` | varchar(32) NOT NULL | `ENABLED` / `DISABLED` / `COMPLETED` |
 | `created_at` | datetime NOT NULL | 创建时间，DB 自动生成 |
 | `updated_at` | datetime NOT NULL | 更新时间，DB `ON UPDATE` 自动维护 |
 | `next_run_time` | datetime NULL | 下次执行时间 |
@@ -105,6 +109,7 @@ task/
   "name": "icu-data-check",
   "type": "ICU_CHECK",
   "interval": 10,
+  "max_runs": 3,
   "next_run_time": "2026-10-20T10:00:00Z"
 }
 ```
@@ -131,19 +136,18 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 
 ---
 
-## 目前存在的问题
+## 问题清单（含已修复项）
 
 ### P1 —— 会导致数据错误或功能整体失效
 
-1. **调度器"取到期任务 + 改下次时间"不在事务内，且 UPDATE 失败只打印日志**
-   `scheduler.go` 的 `findDueTasks` 先 SELECT 再逐行 UPDATE，中间无事务；UPDATE 失败只 `fmt.Println`，函数仍正常返回任务列表。
-   → 一旦 UPDATE 失败或进程在两步之间被杀，同一任务会在下一个 tick 被**重复选中执行**。这正是执行记录表里出现大量重复任务的原因。
+1. ~~**调度器"取到期任务 + 改下次时间"不在事务内，且 UPDATE 失败只打印日志**~~
+   **已于 2026-10-20 修复**：`findDueTasks` 改为逐条原子认领。`claim` 的 `UPDATE ... WHERE next_run_time <= NOW()` 在并发下只有一条能推进时间，认领失败的任务本轮跳过，不会重复执行。
 
-2. **下次执行时间硬编码 `INTERVAL 10 MINUTE`，完全忽略 `interval_seconds`**
-   `scheduler.go:99` 写死 10 分钟。一个 `interval_seconds = 10` 的任务实际要 10 分钟才跑一次；且基准取 `NOW()` 而非上次的 `next_run_time`，会累积执行耗时造成的漂移。
+2. ~~**下次执行时间硬编码 `INTERVAL 10 MINUTE`，完全忽略 `interval_seconds`**~~
+   **已于 2026-10-20 修复**：改为 `DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)`。基准取 `NOW()` 意味着停机期间错过的执行会被跳过，不做补跑。
 
-3. **`next_run_time` 为 NULL 会导致调度器整体停摆**
-   该列定义为 `DEFAULT NULL`，而 Go 结构体字段是 `time.Time`（非指针）。任何一行取到 NULL 都会让**整条查询报错**，`GET /api/tasks` 返回 500、调度器 `findDueTasks` 直接失败返回 —— 不是跳过那一行，而是全部停摆。
+3. ~~**`next_run_time` 为 NULL 会导致调度器整体停摆**~~
+   **已于 2026-10-20 修复**：`Task.Next_time` 改为 `*time.Time`；调度查询增加 `next_run_time IS NOT NULL`。任务完成后该列会被置为 `NULL`。
 
 ### P2 —— 特定条件下的功能或健壮性问题
 
@@ -162,15 +166,15 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 8. **时区语义不一致**
    连接串用 `loc=Local` 让驱动按本地时区转换 Go 的 `time.Time`，而 SQL 里的 `NOW()` 取的是 MySQL 服务器时区。两者不一致时，任务会提前或延迟数小时触发。（本机实测两者当前一致，属潜在风险。）
 
-9. **`Interval` 无下界校验**
-   `binding:"required"` 不拦 0 和负数。等第 2 条修好后，`interval = 0` 会变成"永不停歇地重复执行"。
+9. ~~**`Interval` 无下界校验**~~
+   **已于 2026-10-20 修复**：创建接口改为 `binding:"required,gt=0"`，调度查询也会排除 `interval_seconds <= 0` 的行。注意：数据库层没有 `CHECK` 约束，直接写库仍可绕过。
 
 10. **`InsertSql` 的写入失败会丢失整条执行记录**
     若 `INSERT` 服务端已提交、只是响应丢失，客户端会认为失败；若重试则会产生重复行。目前**刻意不重试**（INSERT 不幂等），这是已知取舍。
 
 ### P3 —— 可读性与工程化
 
-11. `tasks` 表缺少 `(status, next_run_time)` 索引，`execuate_tasks` 缺少 `task_id` 索引 —— 每 2 秒全表扫描。
+11. `tasks` 表仍缺少 `(status, next_run_time)` 索引，调度查询每 2 秒全表扫描。`execuate_tasks` 的 `(task_id, status)` 索引已于 2026-10-20 补上，用于统计 `max_runs` 成功次数。
 12. **没有版本化的建表脚本**，表结构靠手工维护，换环境无法复现。
 13. `execuate.go` 中定义的 `Execute` 接口从未被使用。
 14. 命名问题：包名 `execuate`（应为 `execute`）、`module`（通常叫 `model`）、字段 `Next_time`（应为 `NextTime`）、receiver 用 `this`（Go 惯用短名）。
@@ -187,20 +191,14 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 
 ### 第一阶段：让单机版跑稳
 
-1. **原子认领到期任务**（解决 P1-1 的根因）
-   把"查询到期任务"和"推进下次执行时间"合并成一次原子操作，用 `RowsAffected()` 判断是否认领成功：
-   ```sql
-   UPDATE tasks
-   SET next_run_time = DATE_ADD(next_run_time, INTERVAL interval_seconds SECOND)
-   WHERE id = ? AND status = 'ENABLED' AND next_run_time = ?
-   ```
-   MySQL 8.0 也支持 `SELECT ... FOR UPDATE SKIP LOCKED`，可在不加新依赖的前提下支持多实例。
+1. ~~**原子认领到期任务**~~ **已完成 2026-10-20**
+   `findDueTasks` 查询到期任务后逐条执行 `claim`，用 `RowsAffected() == 1` 判断认领成功；`UPDATE` 的 `WHERE` 中重复检查 `next_run_time <= NOW()`，并发实例只有一个能推进时间。
 
-2. **用 `interval_seconds` 计算下次执行时间**（修 P1-2）
-   基于 `next_run_time` 累加而非基于 `NOW()`，避免漂移。需要一并定义**停机期间错过的执行如何处理**：跳过、补跑一次、还是全部补跑。
+2. ~~**用 `interval_seconds` 计算下次执行时间**~~ **已完成 2026-10-20**
+   当前采用 `DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)`，即**跳过停机期间错过的执行**。若后续需要补跑或严格保持节奏，需要再定义策略。
 
-3. **修复 `next_run_time` 的 NULL 问题**（修 P1-3）
-   字段改为 `*time.Time`，或把列改为 `NOT NULL`。
+3. ~~**修复 `next_run_time` 的 NULL 问题**~~ **已完成 2026-10-20**
+   字段改为 `*time.Time`，调度查询增加 `next_run_time IS NOT NULL`。
 
 4. **按 `task.Type` 分发到具体执行器**（补 P2-5）
    用注册表或工厂模式，把 `cron` / `ICU_CHECK` 等类型映射到各自的执行实现。这是让项目从"调度框架"变成"能真正干活"的关键一步。
@@ -227,10 +225,22 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 10. 配置外置：DSN 从环境变量读取，不硬编码凭据。
 11. 引入结构化日志（`log/slog`）与基础指标。
 12. 统一命名与目录拼写，补齐建表脚本与索引。
+13. 补齐任务更新接口：允许修改 `max_runs`、恢复 `COMPLETED` 任务、重新启用已停用任务。
 
 ---
 
 ## 更新日志
+
+### 2026-10-20
+- 任务增加 `max_runs`：最大成功执行次数，`NULL` 表示不限，`1` 表示只执行一次
+- 成功次数由 `COUNT(execuate_tasks WHERE status='SUCCESS')` 实时聚合，不维护冗余计数字段，避免重试造成计数漂移
+- 调度器改为原子认领：`UPDATE ... WHERE next_run_time <= NOW()`，并发实例只有一个能推进时间，修复重复执行
+- 下次执行时间改用 `interval_seconds` 计算，不再硬编码 10 分钟；停机期间错过的执行直接跳过
+- 达到 `max_runs` 的任务自动置为 `COMPLETED`，并把 `next_run_time` 置为 `NULL`
+- `Task.Next_time` 改为 `*time.Time`，修复 `next_run_time` 为 NULL 时整条查询失败的问题
+- 创建任务接口增加 `max_runs` 参数，`interval` 增加 `gt=0` 校验
+- 新增 `migrations/001_add_max_runs.sql`，并已在本机 `task_scheduler` 库执行
+- 已知数据问题（本次未处理）：34 条孤儿 `RUNNING` 记录、12 条小写 `success` 记录（不会被 `max_runs` 统计）
 
 ### 2026-10-19
 - 为执行结果的数据库写入增加重试：`execuate/retry.go` 新增可注入的重试策略与 MySQL 错误分类白名单
