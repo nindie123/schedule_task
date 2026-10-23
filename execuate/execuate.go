@@ -40,7 +40,7 @@ func (this *Executor) init(task *module.Task) (*module.TaskExecution, error) {
 	exe_task := this.StartTask(task)
 	err := this.InsertSql(exe_task)
 	if err != nil {
-		return nil, err
+		return exe_task, err
 	}
 	return exe_task, nil
 
@@ -53,7 +53,6 @@ func (this *Executor) Exec(task *module.Task) error {
 		exe_task.FinishedAt = &now
 		msg := init_err.Error()
 		exe_task.ErrorMessage = &msg
-		this.FinishExe(exe_task)
 		return fmt.Errorf(
 			"init task %d execution: %w",
 			task.ID,
@@ -66,22 +65,31 @@ func (this *Executor) Exec(task *module.Task) error {
 		now := time.Now()
 		exe_task.FinishedAt = &now
 		msg := exe_err.Error()
+
 		exe_task.ErrorMessage = &msg
-		this.FinishExe(exe_task)
+		update_error := this.FinishExe(exe_task)
+		if update_error != nil {
+			fmt_error := fmt.Errorf(
+				"exe task %d execution: %w",
+				task.ID,
+				exe_err,
+			)
+			res := errors.Join(update_error, fmt_error)
+			return res
+		}
 		return fmt.Errorf(
 			"exe task %d execution: %w",
 			task.ID,
 			exe_err,
 		)
 	}
-	time.Sleep(5 * time.Second)
+
 	now := time.Now()
 	exe_task.FinishedAt = &now
 	exe_task.Status = module.ExecutionSuccess
 	update_err := this.FinishExe(exe_task)
 
 	if update_err != nil {
-
 		return fmt.Errorf(
 			"update task %d execution: %w",
 			task.ID,
@@ -145,6 +153,14 @@ func (this *Executor) FinishExe(task *module.TaskExecution) error {
             finished_at = ?
         WHERE id = ?
     `
+	//防止sql插入错误信息大于255，引起数据库错误
+	//没有这个if判断，会导致成功路径发生错误
+	if task.ErrorMessage != nil {
+		runes := []rune(*task.ErrorMessage)
+		if len(runes) > 255 {
+			*task.ErrorMessage = string(runes[:255])
+		}
+	}
 
 	var rows int64
 	err := defaultRetry.Do(func() error {
