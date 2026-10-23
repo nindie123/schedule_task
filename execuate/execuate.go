@@ -25,10 +25,7 @@ type Execute interface {
 }
 
 func (this *Executor) Exe(task *module.TaskExecution) error {
-	time.Sleep(5 * time.Second)
-	now := time.Now()
-	task.FinishedAt = &now
-	task.Status = module.ExecutionSuccess
+	//明确各处代码职责
 	return nil
 
 }
@@ -51,6 +48,12 @@ func (this *Executor) init(task *module.Task) (*module.TaskExecution, error) {
 func (this *Executor) Exec(task *module.Task) error {
 	exe_task, init_err := this.init(task)
 	if init_err != nil {
+		exe_task.Status = module.ExecutionFailed
+		now := time.Now()
+		exe_task.FinishedAt = &now
+		msg := init_err.Error()
+		exe_task.ErrorMessage = &msg
+		this.FinishExe(exe_task)
 		return fmt.Errorf(
 			"init task %d execution: %w",
 			task.ID,
@@ -58,22 +61,31 @@ func (this *Executor) Exec(task *module.Task) error {
 		)
 	}
 	exe_err := this.Exe(exe_task)
-
+	if exe_err != nil {
+		exe_task.Status = module.ExecutionFailed
+		now := time.Now()
+		exe_task.FinishedAt = &now
+		msg := exe_err.Error()
+		exe_task.ErrorMessage = &msg
+		this.FinishExe(exe_task)
+		return fmt.Errorf(
+			"exe task %d execution: %w",
+			task.ID,
+			exe_err,
+		)
+	}
+	time.Sleep(5 * time.Second)
+	now := time.Now()
+	exe_task.FinishedAt = &now
+	exe_task.Status = module.ExecutionSuccess
 	update_err := this.FinishExe(exe_task)
+
 	if update_err != nil {
 
 		return fmt.Errorf(
 			"update task %d execution: %w",
 			task.ID,
 			update_err,
-		)
-	}
-
-	if exe_err != nil {
-		return fmt.Errorf(
-			"exe task %d execution: %w",
-			task.ID,
-			exe_err,
 		)
 	}
 

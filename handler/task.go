@@ -73,7 +73,7 @@ func CreateTask(c *gin.Context) {
 	// created_at / updated_at 由数据库生成，回读补全同一个对象
 	err = config.DB.Get(
 		&task,
-		"SELECT * FROM tasks WHERE id = ?",
+		"SELECT id, name, type, interval_seconds, max_runs, status, created_at, updated_at, next_run_time FROM tasks WHERE id = ?",
 		task.ID,
 	)
 
@@ -112,8 +112,12 @@ func GetTasks(c *gin.Context) {
 		})
 		return
 	}
+	if len(tasks) == 0 {
+		tasks = make([]model.Task, 0)
 
+	}
 	c.JSON(http.StatusOK, tasks)
+
 }
 
 // PUT /api/tasks/:id/disable
@@ -132,7 +136,8 @@ func DisableTask(c *gin.Context) {
 	var task model.Task
 	err = config.DB.Get(
 		&task,
-		"SELECT * FROM tasks WHERE id = ?",
+		`SELECT  id,name, type, interval_seconds, max_runs, status, created_at, updated_at, next_run_time
+		FROM tasks WHERE id = ?`,
 		id,
 	)
 
@@ -170,10 +175,10 @@ func DisableTask(c *gin.Context) {
 	}
 
 	// 4. updated_at 由数据库 ON UPDATE CURRENT_TIMESTAMP 维护，回读进同一个对象
-	// 目前还没有实现，
+
 	err = config.DB.Get(
 		&task,
-		"SELECT * FROM tasks WHERE id = ?",
+		"SELECT id,name, type, interval_seconds, max_runs, status, created_at, updated_at, next_run_time FROM tasks WHERE id = ?",
 		id,
 	)
 	if err != nil {
