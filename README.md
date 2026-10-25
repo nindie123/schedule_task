@@ -35,8 +35,9 @@ task/
 │
 └── execuate/                执行器（目录名为历史拼写，正确拼写应为 execute）
     ├── execuate.go          执行流程：写执行记录 → 执行 → 回写结果
-    └── retry.go             数据库写入的重试策略与 MySQL 错误分类
-    └── retry_test.go        retry.go 的单元测试
+    ├── retry.go             数据库写入的重试策略与 MySQL 错误分类
+    ├── retry_test.go        retry.go 的单元测试
+    └── error_test.go        Exec/FinishExe 落库行为的单元测试（fake driver）
 ```
 
 ### 各层职责
@@ -151,11 +152,11 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 
 ### P2 —— 特定条件下的功能或健壮性问题
 
-4. **调度循环被同步执行阻塞**
-   `scan()` 里同步调用 `Exec`，而 `Exe` 内含 `Sleep(5s)`。有多个到期任务时会串行阻塞；`time.Ticker` 的 channel 容量为 1，阻塞期间的 tick 会被丢弃，扫描周期实际远大于设定的 2 秒。
+4. **调度循环被同步执行阻塞（仍未修复）**
+   `scan()` 里同步调用 `Exec`。执行器目前是空实现（见第 5 条），所以暂时不会阻塞；一旦接入真实业务执行，多个到期任务会串行阻塞，`time.Ticker` 的 channel 容量为 1，阻塞期间的 tick 会被丢弃，扫描周期实际远大于设定的 2 秒。
 
-5. **执行器是占位实现，`task.Type` 完全未被使用**
-   `Exe` 目前只是 `Sleep(5s)` 然后置为成功。无论 `type` 是 `cron` 还是 `ICU_CHECK` 都走同一条路 —— 真正的任务执行逻辑还没开始写。
+5. **执行器仍是占位实现，`task.Type` 完全未被使用**
+   `Executor` 新增了可注入的 `execute func(*module.TaskExecution) error` 字段，但 `NewExecutor` 不会设置它，包外也无法赋值，因此生产路径上 `Exe` 恒返回 `nil`：写入一条 `RUNNING` 记录后立即置为 `SUCCESS`。无论 `type` 是 `cron` 还是 `ICU_CHECK` 都走同一条路 —— 真正的任务执行逻辑还没开始写。
 
 6. **孤儿 RUNNING 记录无回收机制**
    进程被杀或写库失败时留下的 `RUNNING` 记录永远不会收敛。当前库里已累积 **34 条**孤儿 RUNNING 记录。
@@ -179,11 +180,37 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 13. `execuate.go` 中定义的 `Execute` 接口从未被使用。
 14. 命名问题：包名 `execuate`（应为 `execute`）、`module`（通常叫 `model`）、字段 `Next_time`（应为 `NextTime`）、receiver 用 `this`（Go 惯用短名）。
 15. JSON tag 不一致：入参是 `next_run_time`，出参是 `next_runtime`。
-16. 回读用 `SELECT *`，与其它查询的显式列风格不统一，且对加列脆弱。
-17. `GET /api/tasks` 无分页；无数据时返回 `null` 而非 `[]`。
+16. ~~回读用 `SELECT *`~~ **当前代码已改为显式列清单**（2026-10-23 审查确认）：handler 的四处回读与 `isFinishApplied` 都只查询所需列。
+17. `GET /api/tasks` 仍无分页。无数据时返回 `null` 的问题已修复，当前返回 `[]`。
 18. 数据库凭据硬编码在 `config/database.go`。
 19. 日志全部使用 `fmt.Println` / `println`，无级别、无结构化。
-20. `Exec` 中 `update_err` 优先于 `exe_err` 返回，两者都非空时 `exe_err` 被吞掉。
+20. ~~`Exec` 中 `update_err` 优先于 `exe_err` 返回，两者都非空时 `exe_err` 被吞掉。~~
+    **已修复**：改用 `errors.Join` 同时返回两个错误，并由 `TestExec_ExecutionAndFinishBothFail` 覆盖。
+
+### 2026-10-23 代码审查新增发现
+
+以下问题在本次审查中发现，均**未修改代码**，仅记录：
+
+21. **执行时长不受 interval 约束**
+    认领时按 `DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)` 推进下次执行时间。若单次执行超过 `interval_seconds`，执行结束后的下一轮扫描会立刻再次认领该任务：单机串行执行不会并发，但配置的间隔实际失效；多实例部署时则可能并发执行同一任务。修复方向是引入租约/心跳（见 P2-6、P2-7）。
+
+22. **`init` 失败路径不落库**
+    `InsertSql` 失败时，`Exec` 只修改内存中的 `TaskExecution` 后返回错误，不会写任何记录。若 INSERT 服务端已提交、只是响应或 `LastInsertId` 返回失败，该行会永久停在 `RUNNING`，与 P2-6 的孤儿记录同源。
+
+23. **`execute` 字段在包外不可注入**
+    `execute` 未导出，`NewExecutor` 也不给它赋值，`scheduler` 又是每个任务新建一个 `Executor`。该字段目前只服务于单元测试；后续按 `task.Type` 分发时，需要改为构造时注入或使用注册表。
+
+24. **编译产物 `main`（约 30 MB）被提交进仓库**
+    `.gitignore` 只忽略了 `.claude/` 和 `CLAUDE.md`。建议后续把 `main` 加入忽略列表并从版本库移除（需要单独授权）。
+
+25. **测试注释过期**
+    `execuate/error_test.go` 文件头仍写"三个场景"（现为 5 个）；`TestExec_SuccessResult` 的注释仍称 `Exe` 内含 5 秒 `Sleep`（现为 `nil` 立即返回）。属注释问题，未改动代码。
+
+26. **`InitDB` 不会真正连接数据库**
+    `sqlx.Open` 只校验 DSN，不会建立连接。凭据错误或 MySQL 未启动时，`InitDB` 仍返回 `nil` 并打印 "MySQL connect success"，问题要到第一次查询才暴露。另外 `InsertSql` 使用的是不带 context 的 `DB.Exec`，没有超时保护，数据库挂起时会一直阻塞调度循环。建议增加 `PingContext` 与连接池参数（需要单独授权）。
+
+27. **`FinishExe` 的部分分支没有测试覆盖**
+    fake driver 的 `RowsAffected` 固定返回 1，因此 `rows == 0 → isFinishApplied` 这条回读分支未被测试；"前两次瞬时失败、第三次成功"的 `FinishExe` 重试集成场景同样没有覆盖（`retry_test.go` 只测了策略本身）。
 
 ---
 
@@ -221,7 +248,7 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 
 ### 第三阶段：工程化
 
-9. 补齐测试（目前仅 `retry_test.go` 一个测试文件）。
+9. 补齐测试（目前只有 `execuate` 包的 `retry_test.go` 与 `error_test.go`；`scheduler` 与 `handler` 尚无测试）。
 10. 配置外置：DSN 从环境变量读取，不硬编码凭据。
 11. 引入结构化日志（`log/slog`）与基础指标。
 12. 统一命名与目录拼写，补齐建表脚本与索引。
@@ -230,6 +257,12 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 ---
 
 ## 更新日志
+
+### 2026-10-23
+- 执行逻辑抽成可注入的 `Executor.execute` 字段；`nil` 时保持原行为（`Exe` 直接返回 `nil`），便于测试注入成功/失败场景
+- `Exec` 在"执行失败 + 结果落库失败"时通过 `errors.Join` 同时返回两个错误（原 P3-20）
+- 新增 `execuate/error_test.go`：覆盖成功、失败、超长错误信息、执行报错、执行与落库同时失败五个场景
+- 按实际代码复核 README：更新执行器现状、P3-16/P3-17/P3-20 的修复状态，新增 7 条审查发现
 
 ### 2026-10-20
 - 任务增加 `max_runs`：最大成功执行次数，`NULL` 表示不限，`1` 表示只执行一次

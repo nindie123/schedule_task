@@ -39,8 +39,21 @@ type recordedExec struct {
 }
 
 type recordedDB struct {
-	mu    sync.Mutex
-	execs []recordedExec
+	mu        sync.Mutex
+	execs     []recordedExec
+	updateErr error // 非 nil 时，UPDATE 语句直接返回该错误
+}
+
+func (r *recordedDB) setUpdateError(err error) {
+	r.mu.Lock()
+	r.updateErr = err
+	r.mu.Unlock()
+}
+
+func (r *recordedDB) getUpdateError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.updateErr
 }
 
 func (r *recordedDB) record(query string, args []driver.NamedValue) {
@@ -88,7 +101,12 @@ func (c *recordingConn) Begin() (driver.Tx, error) {
 }
 
 func (c *recordingConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	// 先记录参数，保证 UPDATE 失败时也能断言"准备写入的值"。
 	c.rec.record(query, args)
+
+	if err := c.rec.getUpdateError(); err != nil && strings.Contains(strings.ToUpper(query), "UPDATE") {
+		return nil, err
+	}
 
 	// 固定返回 1 行受影响，让 FinishExe 走正常路径，不触发回读确认。
 	return recordingResult{}, nil
@@ -138,8 +156,6 @@ func updateArgs(t *testing.T, e recordedExec) (errMsg, status, finishedAt, id dr
 func TestExec_SuccessResult(t *testing.T) {
 	db, rec := newRecordingDB(t)
 	ex := NewExecutor(db)
-
-	// 注意：Exec 里的 Exe 目前内含 5 秒 Sleep，本用例会实际耗时约 5 秒。
 	if err := ex.Exec(&module.Task{ID: 42}); err != nil {
 		t.Fatalf("Exec 返回错误: %v", err)
 	}
@@ -246,5 +262,70 @@ func TestFinishExe_LongErrorMessage(t *testing.T) {
 	}
 	if got == "" {
 		t.Error("落库的 error_message 为空，期望保留错误信息的前缀")
+	}
+}
+
+// ---------- 场景 4：执行返回错误 ----------
+
+func TestExec_ExecutionError(t *testing.T) {
+	db, rec := newRecordingDB(t)
+	sentinel := errors.New("下游接口不可用")
+
+	ex := NewExecutor(db)
+	ex.execute = func(*module.TaskExecution) error { return sentinel }
+
+	err := ex.Exec(&module.Task{ID: 42})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Exec 返回的 error 应能识别 sentinel，实际: %v", err)
+	}
+
+	errMsg, status, finishedAt, id := updateArgs(t, rec.lastExec(t))
+
+	if status != string(module.ExecutionFailed) {
+		t.Errorf("status = %v，期望 %q", status, module.ExecutionFailed)
+	}
+	if got, ok := errMsg.(string); !ok || got != sentinel.Error() {
+		t.Errorf("error_message = %v，期望 %q", errMsg, sentinel.Error())
+	}
+	if finishedAt == nil {
+		t.Error("finished_at = NULL，期望非空")
+	}
+	// InsertSql 的 LastInsertId 由 fake driver 固定返回 1。
+	if id != int64(1) {
+		t.Errorf("更新条件 id = %v，期望 1", id)
+	}
+}
+
+// ---------- 场景 5：执行和落库同时失败 ----------
+
+func TestExec_ExecutionAndFinishBothFail(t *testing.T) {
+	db, rec := newRecordingDB(t)
+	exeErr := errors.New("execution failed")
+	updateErr := errors.New("update failed")
+	// 普通错误不可重试，FinishExe 会立即返回，不会触发退避等待。
+	rec.setUpdateError(updateErr)
+
+	ex := NewExecutor(db)
+	ex.execute = func(*module.TaskExecution) error { return exeErr }
+
+	err := ex.Exec(&module.Task{ID: 42})
+	if !errors.Is(err, exeErr) {
+		t.Fatalf("Exec 返回的 error 应能识别执行错误，实际: %v", err)
+	}
+	if !errors.Is(err, updateErr) {
+		t.Fatalf("Exec 返回的 error 应能识别落库错误，实际: %v", err)
+	}
+
+	// driver 先记录参数再返回错误，因此仍能确认写入的是 FAILED 结果。
+	errMsg, status, finishedAt, _ := updateArgs(t, rec.lastExec(t))
+
+	if status != string(module.ExecutionFailed) {
+		t.Errorf("status = %v，期望 %q", status, module.ExecutionFailed)
+	}
+	if got, ok := errMsg.(string); !ok || got != exeErr.Error() {
+		t.Errorf("error_message = %v，期望 %q", errMsg, exeErr.Error())
+	}
+	if finishedAt == nil {
+		t.Error("finished_at = NULL，期望非空")
 	}
 }

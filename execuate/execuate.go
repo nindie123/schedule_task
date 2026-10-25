@@ -19,15 +19,20 @@ const dbOpTimeout = 2 * time.Second
 // Executor 负责任务执行流程。
 type Executor struct {
 	DB *sqlx.DB
+	// execute 是可替换的执行逻辑，nil 表示什么都不做（保持原行为）。
+	// 抽成字段是为了测试时注入成功/失败场景；
+	// 后续可以替换为按 task.Type 分发的注册表。
+	execute func(*module.TaskExecution) error
 }
 type Execute interface {
 	Exe(task *module.TaskExecution) error
 }
 
 func (this *Executor) Exe(task *module.TaskExecution) error {
-	//明确各处代码职责
-	return nil
-
+	if this.execute == nil {
+		return nil
+	}
+	return this.execute(task)
 }
 
 func NewExecutor(db *sqlx.DB) *Executor {
@@ -37,57 +42,52 @@ func NewExecutor(db *sqlx.DB) *Executor {
 }
 
 func (this *Executor) init(task *module.Task) (*module.TaskExecution, error) {
-	exe_task := this.StartTask(task)
-	err := this.InsertSql(exe_task)
+	exeTask := this.StartTask(task)
+	err := this.InsertSql(exeTask)
 	if err != nil {
-		return exe_task, err
+		return exeTask, err
 	}
-	return exe_task, nil
+	return exeTask, nil
 
 }
 func (this *Executor) Exec(task *module.Task) error {
-	exe_task, init_err := this.init(task)
-	if init_err != nil {
-		exe_task.Status = module.ExecutionFailed
-		now := time.Now()
-		exe_task.FinishedAt = &now
-		msg := init_err.Error()
-		exe_task.ErrorMessage = &msg
+	exeTask, initErr := this.init(task)
+	if initErr != nil {
 		return fmt.Errorf(
 			"init task %d execution: %w",
 			task.ID,
-			init_err,
+			initErr,
 		)
 	}
-	exe_err := this.Exe(exe_task)
-	if exe_err != nil {
-		exe_task.Status = module.ExecutionFailed
+	exeErr := this.Exe(exeTask)
+	if exeErr != nil {
+		exeTask.Status = module.ExecutionFailed
 		now := time.Now()
-		exe_task.FinishedAt = &now
-		msg := exe_err.Error()
+		exeTask.FinishedAt = &now
+		msg := exeErr.Error()
 
-		exe_task.ErrorMessage = &msg
-		update_error := this.FinishExe(exe_task)
-		if update_error != nil {
-			fmt_error := fmt.Errorf(
+		exeTask.ErrorMessage = &msg
+		updateErr := this.FinishExe(exeTask)
+		if updateErr != nil {
+			fmtErr := fmt.Errorf(
 				"exe task %d execution: %w",
 				task.ID,
-				exe_err,
+				exeErr,
 			)
-			res := errors.Join(update_error, fmt_error)
+			res := errors.Join(updateErr, fmtErr)
 			return res
 		}
 		return fmt.Errorf(
 			"exe task %d execution: %w",
 			task.ID,
-			exe_err,
+			exeErr,
 		)
 	}
 
 	now := time.Now()
-	exe_task.FinishedAt = &now
-	exe_task.Status = module.ExecutionSuccess
-	update_err := this.FinishExe(exe_task)
+	exeTask.FinishedAt = &now
+	exeTask.Status = module.ExecutionSuccess
+	update_err := this.FinishExe(exeTask)
 
 	if update_err != nil {
 		return fmt.Errorf(
@@ -119,12 +119,20 @@ func (this *Executor) InsertSql(execution *module.TaskExecution) error {
 	const sql = `INSERT INTO execuate_tasks
 				(task_id,status,started_at)
 				VALUES (?,?,?)`
-	result, err := this.DB.Exec(
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		1*time.Minute,
+	)
+
+	result, err := this.DB.ExecContext(
+		ctx,
 		sql,
 		execution.TaskID,
 		execution.Status,
 		execution.StartedAt,
 	)
+	defer cancel()
 	if err != nil {
 		fmt.Printf("insert execution failed: %v\n", err)
 		return err
