@@ -18,11 +18,13 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-// 本文件验证执行结果落库的三个场景：
+// 本文件验证执行结果落库的五个场景：
 //
-//  1. 执行返回 nil        → status=SUCCESS、finished_at 非空、error_message=NULL
-//  2. 执行返回错误         → status=FAILED、finished_at 非空、error_message 内容正确
-//  3. 错误信息超过 255 字  → status=FAILED，落库值不超过 255 个字符且是合法 UTF-8
+//  1. 执行返回 nil         → status=SUCCESS、finished_at 非空、error_message=NULL
+//  2. FinishExe 写入失败结果 → status=FAILED、finished_at 非空、error_message 内容正确
+//  3. 错误信息超过 255 字   → status=FAILED，落库值不超过 255 个字符且是合法 UTF-8
+//  4. 执行返回错误          → Exec 落库 FAILED，并把原始错误返回给调用方
+//  5. 执行与落库同时失败     → 两个错误都能通过 errors.Is 识别
 //
 // 测试不连接真实 MySQL：用一个只记录 SQL 参数的 fake driver，
 // 断言的是"准备写入数据库的值"，即最终会进入 varchar(255) 列的值。
@@ -179,11 +181,10 @@ func TestExec_SuccessResult(t *testing.T) {
 	}
 }
 
-// ---------- 场景 2：执行返回错误 ----------
+// ---------- 场景 2：FinishExe 写入失败结果 ----------
 
-// FAILED 状态由 Exec 在 Exe 返回错误时设置；当前 Exe 是恒返回 nil 的占位实现，
-// 无法从 Exec 触发失败路径，所以这里直接构造 Exec 会写入的 TaskExecution，
-// 验证 FinishExe 把状态和错误信息正确落库。
+// 这里直接构造 Exec 会写入的 TaskExecution，验证 FinishExe 本身把状态和错误信息落库；
+// 通过 Exec 触发失败路径的场景见场景 4。
 func TestFinishExe_FailedResult(t *testing.T) {
 	db, rec := newRecordingDB(t)
 	ex := NewExecutor(db)

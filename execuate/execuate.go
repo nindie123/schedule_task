@@ -122,9 +122,9 @@ func (this *Executor) InsertSql(execution *module.TaskExecution) error {
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
-		1*time.Minute,
+		2*time.Second,
 	)
-
+	defer cancel()
 	result, err := this.DB.ExecContext(
 		ctx,
 		sql,
@@ -132,7 +132,7 @@ func (this *Executor) InsertSql(execution *module.TaskExecution) error {
 		execution.Status,
 		execution.StartedAt,
 	)
-	defer cancel()
+
 	if err != nil {
 		fmt.Printf("insert execution failed: %v\n", err)
 		return err

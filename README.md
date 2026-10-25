@@ -16,7 +16,8 @@ task/
 ├── go.mod / go.sum          模块定义与依赖锁定
 │
 ├── config/
-│   └── database.go          MySQL 连接初始化，导出全局 *sqlx.DB
+│   ├── database.go          MySQL 连接初始化（Ping、连接池），导出全局 *sqlx.DB
+│   └── database_test.go     初始化成功与连接失败路径的测试
 │
 ├── module/
 │   └── task.go              数据模型：Task（任务表）、TaskExecution（执行记录表）、状态常量
@@ -66,7 +67,7 @@ task/
 
 ## 数据库表结构
 
-> 目前没有版本化的建表脚本，表结构靠手工维护（见「目前存在的问题」第 12 条）。
+> 目前没有版本化的建表脚本，表结构靠手工维护（见「问题清单」第 12 条）。
 
 ### `tasks` —— 任务定义表
 
@@ -137,41 +138,39 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 
 ---
 
-## 问题清单（含已修复项）
-
-### P1 —— 会导致数据错误或功能整体失效
-
-1. ~~**调度器"取到期任务 + 改下次时间"不在事务内，且 UPDATE 失败只打印日志**~~
-   **已于 2026-10-20 修复**：`findDueTasks` 改为逐条原子认领。`claim` 的 `UPDATE ... WHERE next_run_time <= NOW()` 在并发下只有一条能推进时间，认领失败的任务本轮跳过，不会重复执行。
-
-2. ~~**下次执行时间硬编码 `INTERVAL 10 MINUTE`，完全忽略 `interval_seconds`**~~
-   **已于 2026-10-20 修复**：改为 `DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)`。基准取 `NOW()` 意味着停机期间错过的执行会被跳过，不做补跑。
-
-3. ~~**`next_run_time` 为 NULL 会导致调度器整体停摆**~~
-   **已于 2026-10-20 修复**：`Task.Next_time` 改为 `*time.Time`；调度查询增加 `next_run_time IS NOT NULL`。任务完成后该列会被置为 `NULL`。
+## 问题清单
 
 ### P2 —— 特定条件下的功能或健壮性问题
 
-4. **调度循环被同步执行阻塞（仍未修复）**
-   `scan()` 里同步调用 `Exec`。执行器目前是空实现（见第 5 条），所以暂时不会阻塞；一旦接入真实业务执行，多个到期任务会串行阻塞，`time.Ticker` 的 channel 容量为 1，阻塞期间的 tick 会被丢弃，扫描周期实际远大于设定的 2 秒。
+1. **调度循环被同步执行阻塞**
+   `scan()` 里同步调用 `Exec`。执行器目前是空实现（见第 2 条），所以暂时不会阻塞；一旦接入真实业务执行，多个到期任务会串行阻塞，`time.Ticker` 的 channel 容量为 1，阻塞期间的 tick 会被丢弃，扫描周期实际远大于设定的 2 秒。
 
-5. **执行器仍是占位实现，`task.Type` 完全未被使用**
-   `Executor` 新增了可注入的 `execute func(*module.TaskExecution) error` 字段，但 `NewExecutor` 不会设置它，包外也无法赋值，因此生产路径上 `Exe` 恒返回 `nil`：写入一条 `RUNNING` 记录后立即置为 `SUCCESS`。无论 `type` 是 `cron` 还是 `ICU_CHECK` 都走同一条路 —— 真正的任务执行逻辑还没开始写。
+2. **执行器仍是占位实现，`task.Type` 完全未被使用**
+   `Executor` 有可注入的 `execute func(*module.TaskExecution) error` 字段，但 `NewExecutor` 不会设置它，包外也无法赋值，因此生产路径上 `Exe` 恒返回 `nil`：写入一条 `RUNNING` 记录后立即置为 `SUCCESS`。无论 `type` 是 `cron` 还是 `ICU_CHECK` 都走同一条路 —— 真正的任务执行逻辑还没开始写。
 
-6. **孤儿 RUNNING 记录无回收机制**
+3. **孤儿 RUNNING 记录无回收机制**
    进程被杀或写库失败时留下的 `RUNNING` 记录永远不会收敛。当前库里已累积 **34 条**孤儿 RUNNING 记录。
 
-7. **无优雅关闭 / 无信号处理**
-   `main.go` 里 `ctx` 是 `context.Background()`，永不取消；收到 SIGINT 直接杀进程，正在执行的任务永远停在 RUNNING（与第 6 条同源）。
+4. **无优雅关闭 / 无信号处理**
+   `main.go` 里 `ctx` 是 `context.Background()`，永不取消；收到 SIGINT 直接杀进程，正在执行的任务永远停在 RUNNING（与第 3 条同源）。即使以后把取消信号传进来，Executor 的数据库操作也不会响应（见第 9 条）。
 
-8. **时区语义不一致**
+5. **时区语义不一致**
    连接串用 `loc=Local` 让驱动按本地时区转换 Go 的 `time.Time`，而 SQL 里的 `NOW()` 取的是 MySQL 服务器时区。两者不一致时，任务会提前或延迟数小时触发。（本机实测两者当前一致，属潜在风险。）
 
-9. ~~**`Interval` 无下界校验**~~
-   **已于 2026-10-20 修复**：创建接口改为 `binding:"required,gt=0"`，调度查询也会排除 `interval_seconds <= 0` 的行。注意：数据库层没有 `CHECK` 约束，直接写库仍可绕过。
+6. **`InsertSql` 的写入失败会丢失整条执行记录**
+   `INSERT` 不幂等，因此刻意不重试。但 `InsertSql` 现在带 2 秒超时：若服务端已提交、只是响应超时或丢失，客户端会认为失败，该行却永久停在 `RUNNING`（与第 3 条同源）。这是当前明确的取舍。
 
-10. **`InsertSql` 的写入失败会丢失整条执行记录**
-    若 `INSERT` 服务端已提交、只是响应丢失，客户端会认为失败；若重试则会产生重复行。目前**刻意不重试**（INSERT 不幂等），这是已知取舍。
+7. **执行时长不受 interval 约束**
+   认领时按 `DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)` 推进下次执行时间。若单次执行超过 `interval_seconds`，执行结束后的下一轮扫描会立刻再次认领该任务：单机串行执行不会并发，但配置的间隔实际失效；多实例部署时则可能并发执行同一任务。修复方向是引入租约/心跳（见第 3、4 条）。
+
+8. **`init` 失败路径不落库**
+   `InsertSql` 返回错误时，`Exec` 直接返回错误，不会写任何记录。若 INSERT 服务端已提交、只是响应或 `LastInsertId` 失败，该行会永久停在 `RUNNING`（与第 6 条是同一问题的两个入口）。
+
+9. **数据库操作无法响应关闭信号**
+   `InsertSql`、`FinishExe`、`isFinishApplied` 都从 `context.Background()` 派生超时，只能保证单次操作不会永久挂起，无法响应调度器关闭信号；`Executor` 也没有接收 `ctx` 的入口。若后续实现优雅关闭，这部分需要一并改造。
+
+10. **`InsertSql` 的超时常量重复硬编码**
+    `InsertSql` 写死 `2*time.Second`，与 `execuate.go` 中的 `dbOpTimeout` 数值重复。调整超时需要改两处，容易不一致；应复用同一个常量，或为 INSERT 定义语义明确的独立常量。
 
 ### P3 —— 可读性与工程化
 
@@ -180,37 +179,13 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 13. `execuate.go` 中定义的 `Execute` 接口从未被使用。
 14. 命名问题：包名 `execuate`（应为 `execute`）、`module`（通常叫 `model`）、字段 `Next_time`（应为 `NextTime`）、receiver 用 `this`（Go 惯用短名）。
 15. JSON tag 不一致：入参是 `next_run_time`，出参是 `next_runtime`。
-16. ~~回读用 `SELECT *`~~ **当前代码已改为显式列清单**（2026-10-23 审查确认）：handler 的四处回读与 `isFinishApplied` 都只查询所需列。
-17. `GET /api/tasks` 仍无分页。无数据时返回 `null` 的问题已修复，当前返回 `[]`。
-18. 数据库凭据硬编码在 `config/database.go`。
-19. 日志全部使用 `fmt.Println` / `println`，无级别、无结构化。
-20. ~~`Exec` 中 `update_err` 优先于 `exe_err` 返回，两者都非空时 `exe_err` 被吞掉。~~
-    **已修复**：改用 `errors.Join` 同时返回两个错误，并由 `TestExec_ExecutionAndFinishBothFail` 覆盖。
-
-### 2026-10-23 代码审查新增发现
-
-以下问题在本次审查中发现，均**未修改代码**，仅记录：
-
-21. **执行时长不受 interval 约束**
-    认领时按 `DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)` 推进下次执行时间。若单次执行超过 `interval_seconds`，执行结束后的下一轮扫描会立刻再次认领该任务：单机串行执行不会并发，但配置的间隔实际失效；多实例部署时则可能并发执行同一任务。修复方向是引入租约/心跳（见 P2-6、P2-7）。
-
-22. **`init` 失败路径不落库**
-    `InsertSql` 失败时，`Exec` 只修改内存中的 `TaskExecution` 后返回错误，不会写任何记录。若 INSERT 服务端已提交、只是响应或 `LastInsertId` 返回失败，该行会永久停在 `RUNNING`，与 P2-6 的孤儿记录同源。
-
-23. **`execute` 字段在包外不可注入**
-    `execute` 未导出，`NewExecutor` 也不给它赋值，`scheduler` 又是每个任务新建一个 `Executor`。该字段目前只服务于单元测试；后续按 `task.Type` 分发时，需要改为构造时注入或使用注册表。
-
-24. **编译产物 `main`（约 30 MB）被提交进仓库**
-    `.gitignore` 只忽略了 `.claude/` 和 `CLAUDE.md`。建议后续把 `main` 加入忽略列表并从版本库移除（需要单独授权）。
-
-25. **测试注释过期**
-    `execuate/error_test.go` 文件头仍写"三个场景"（现为 5 个）；`TestExec_SuccessResult` 的注释仍称 `Exe` 内含 5 秒 `Sleep`（现为 `nil` 立即返回）。属注释问题，未改动代码。
-
-26. **`InitDB` 不会真正连接数据库**
-    `sqlx.Open` 只校验 DSN，不会建立连接。凭据错误或 MySQL 未启动时，`InitDB` 仍返回 `nil` 并打印 "MySQL connect success"，问题要到第一次查询才暴露。另外 `InsertSql` 使用的是不带 context 的 `DB.Exec`，没有超时保护，数据库挂起时会一直阻塞调度循环。建议增加 `PingContext` 与连接池参数（需要单独授权）。
-
-27. **`FinishExe` 的部分分支没有测试覆盖**
-    fake driver 的 `RowsAffected` 固定返回 1，因此 `rows == 0 → isFinishApplied` 这条回读分支未被测试；"前两次瞬时失败、第三次成功"的 `FinishExe` 重试集成场景同样没有覆盖（`retry_test.go` 只测了策略本身）。
+16. `GET /api/tasks` 无分页。
+17. 数据库凭据硬编码在 `config/database.go` 的 `defaultDSN` 中，应改为从环境变量读取。
+18. 日志全部使用 `fmt.Println` / `fmt.Printf` / `println`，无级别、无结构化。
+19. `execute` 字段在包外不可注入；`scheduler` 又是每个任务新建一个 `Executor`，后续按类型分发时无法复用配置或注册表。
+20. 编译产物 `main`（约 30 MB）被提交进仓库，`.gitignore` 只忽略了 `.claude/` 与 `CLAUDE.md`。
+21. `FinishExe` 的部分分支没有测试覆盖：fake driver 的 `RowsAffected` 固定返回 1，`rows == 0 → isFinishApplied` 的回读分支未被测试；"前两次瞬时失败、第三次成功"的重试集成场景也没有覆盖。
+22. **`main.go` 启动失败直接 `panic`**：`config.InitDB()` 与 `r.Run()` 失败时输出完整的运行时堆栈，而不是一行清晰的错误，进程退出码为 2。后续可改为记录日志后 `os.Exit(1)`。
 
 ---
 
@@ -218,51 +193,56 @@ HTTP 请求 ──> handler ──> MySQL(tasks)
 
 ### 第一阶段：让单机版跑稳
 
-1. ~~**原子认领到期任务**~~ **已完成 2026-10-20**
-   `findDueTasks` 查询到期任务后逐条执行 `claim`，用 `RowsAffected() == 1` 判断认领成功；`UPDATE` 的 `WHERE` 中重复检查 `next_run_time <= NOW()`，并发实例只有一个能推进时间。
-
-2. ~~**用 `interval_seconds` 计算下次执行时间**~~ **已完成 2026-10-20**
-   当前采用 `DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)`，即**跳过停机期间错过的执行**。若后续需要补跑或严格保持节奏，需要再定义策略。
-
-3. ~~**修复 `next_run_time` 的 NULL 问题**~~ **已完成 2026-10-20**
-   字段改为 `*time.Time`，调度查询增加 `next_run_time IS NOT NULL`。
-
-4. **按 `task.Type` 分发到具体执行器**（补 P2-5）
+1. **按 `task.Type` 分发到具体执行器**（修问题 2）
    用注册表或工厂模式，把 `cron` / `ICU_CHECK` 等类型映射到各自的执行实现。这是让项目从"调度框架"变成"能真正干活"的关键一步。
 
-5. **并发执行 + worker pool**（修 P2-4）
+2. **并发执行 + worker pool**（修问题 1）
    执行改为异步，并限制并发上限，避免无界 goroutine。
 
-6. **心跳 / 租约 + 启动回收**（修 P2-6、P2-7）
-   给执行记录加心跳字段，进程启动时把超时的 RUNNING 判定为宿主已死并标记 `FAILED`；同时加 `signal.NotifyContext` 做优雅关闭。
+3. **心跳 / 租约 + 启动回收**（修问题 3、4、7）
+   给执行记录加心跳字段，进程启动时把超时的 RUNNING 判定为宿主已死并标记 `FAILED`；同时用 `signal.NotifyContext` 做优雅关闭。
+
+4. **给 Executor 传入 `ctx`，统一数据库超时**（修问题 4、9、10）
+   让 `Exec` / `InsertSql` / `FinishExe` 接收调度器传来的 `ctx`，用 `signal.NotifyContext` 取消；同时复用同一个超时常量，避免 `InsertSql` 与 `dbOpTimeout` 各自硬编码。
+
+5. **启动失败改为日志 + `os.Exit(1)`**（修问题 22）
+   把 `main.go` 的两个 `panic` 改为输出一行错误并以非零码退出，便于服务托管脚本识别。
 
 ### 第二阶段：走向分布式
 
-7. **引入 Redis 做调度协调**
+6. **引入 Redis 做调度协调**
    注意分工：Redis 负责**协调**，不负责**持久化执行结果**（它的持久化语义弱于 MySQL，且会引入双写一致性问题）。
    - 任务认领锁：`SET task:claim:{id} {worker} NX EX 30`
    - Worker 心跳：`SET worker:{id}:hb 1 EX 15`
    - 延迟队列：用 ZSET 替代每 2 秒轮询 MySQL，大幅降低数据库压力
 
-8. **任务分片与多实例部署**，配合第 1 条的原子认领。
+7. **任务分片与多实例部署**，配合现有的原子认领。
 
 ### 第三阶段：工程化
 
-9. 补齐测试（目前只有 `execuate` 包的 `retry_test.go` 与 `error_test.go`；`scheduler` 与 `handler` 尚无测试）。
-10. 配置外置：DSN 从环境变量读取，不硬编码凭据。
-11. 引入结构化日志（`log/slog`）与基础指标。
-12. 统一命名与目录拼写，补齐建表脚本与索引。
-13. 补齐任务更新接口：允许修改 `max_runs`、恢复 `COMPLETED` 任务、重新启用已停用任务。
+8. 补齐测试（目前只有 `execuate` 包的 `retry_test.go`、`error_test.go` 与 `config` 包的 `database_test.go`；`scheduler` 与 `handler` 尚无测试）。
+9. 配置外置：DSN 从环境变量读取，替换 `defaultDSN`（修问题 17）。
+10. 引入结构化日志（`log/slog`）与基础指标（修问题 18）。
+11. 统一命名与目录拼写，补齐建表脚本与索引（修问题 11–15）。
+12. 补齐分页查询与任务更新接口：分页（修问题 16）、允许修改 `max_runs`、恢复 `COMPLETED` 任务、重新启用已停用任务。
 
 ---
 
 ## 更新日志
 
+### 2026-10-25
+- `InitDB` 增加 `PingContext`（10 秒超时）与连接池参数，启动时即可发现凭据或连接问题
+- `InsertSql` 改用带 2 秒超时的 `ExecContext`，避免数据库挂起时无限阻塞调度循环
+- 修正 `sqlx.Open` 失败日志措辞：`Open` 只打开驱动并校验 DSN，不建立连接
+- 新增 `config/database_test.go`，覆盖启动成功与连接失败两条路径
+- 再次审查代码：问题清单删除全部已修复项并重新编号，补充启动 `panic`、数据库操作无法响应关闭信号、`InsertSql` 超时常量重复等发现
+- 修正 `execuate/error_test.go` 中过期的场景说明（场景数、场景 2 的定位）
+
 ### 2026-10-23
 - 执行逻辑抽成可注入的 `Executor.execute` 字段；`nil` 时保持原行为（`Exe` 直接返回 `nil`），便于测试注入成功/失败场景
-- `Exec` 在"执行失败 + 结果落库失败"时通过 `errors.Join` 同时返回两个错误（原 P3-20）
+- `Exec` 在"执行失败 + 结果落库失败"时通过 `errors.Join` 同时返回两个错误
 - 新增 `execuate/error_test.go`：覆盖成功、失败、超长错误信息、执行报错、执行与落库同时失败五个场景
-- 按实际代码复核 README：更新执行器现状、P3-16/P3-17/P3-20 的修复状态，新增 7 条审查发现
+- 按实际代码复核 README：更新执行器现状，补充 7 条审查发现
 
 ### 2026-10-20
 - 任务增加 `max_runs`：最大成功执行次数，`NULL` 表示不限，`1` 表示只执行一次
